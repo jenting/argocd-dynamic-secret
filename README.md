@@ -1,49 +1,69 @@
 # argocd-dynamic-secret
 
-Proof-of-concept Docker Compose environment that demonstrates **dynamic ArgoCD API tokens** backed by HashiCorp Vault acting as the OIDC Identity Provider.
+Proof-of-concept Docker Compose environment that demonstrates **dynamic ArgoCD API tokens** backed by HashiCorp Vault — covering both machine-client access (AppRole + KV) and human browser login (OIDC).
 
-## Overview
+## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  docker compose network (poc-network)                                │
-│                                                                      │
-│  ┌─────────────┐        OIDC Provider         ┌──────────────────┐  │
-│  │   Vault      │◄────────────────────────────►│  ArgoCD (k3s)    │  │
-│  │  :8200       │  Discovery / JWKS / Token    │  :8080 (NodePort)│  │
-│  └──────┬──────┘                              └──────────────────┘  │
-│         │                                                            │
-│  userpass auth                                                       │
-│         │                                                            │
-│  ┌──────▼──────────────────────────────────────────────────────┐    │
-│  │  demo container                                              │    │
-│  │  1. Login to Vault  → short-lived Vault token               │    │
-│  │  2. Get OIDC token  → JWT with groups/email claims (dynamic) │    │
-│  │  3. Use ArgoCD API token (TTL=1h) → create/update/delete app │    │
-│  └─────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  docker compose network (poc-network)                                        │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐    │
+│  │  Vault :8200                                                         │    │
+│  │  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────┐ │    │
+│  │  │  OIDC Provider  │  │  AppRole auth     │  │  KV secret engine   │ │    │
+│  │  │  (browser login)│  │  (machine login)  │  │  argocd/api-token   │ │    │
+│  │  └────────┬────────┘  └────────┬─────────┘  └──────────┬──────────┘ │    │
+│  └───────────│────────────────────│───────────────────────│────────────┘    │
+│              │                    │                        │                  │
+│              │ JWKS/discovery     │ 1. AppRole login       │ 3. read token    │
+│              │                    │    → Vault token(1h)   │                  │
+│              ▼                    ▼                        │                  │
+│  ┌───────────────────┐   ┌────────────────────────────────▼───────────────┐  │
+│  │  ArgoCD (k3s)     │   │  client container                               │  │
+│  │  :8080 (NodePort) │◄──│  2. Vault token → read secret/argocd/api-token │  │
+│  │                   │   │  4. ArgoCD API token → create/update/delete app │  │
+│  └───────────────────┘   └────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Dynamic Secret Flow (client)
+
+```
+Client                  Vault                    ArgoCD
+  │                       │                         │
+  │── AppRole login ──────►│                         │
+  │◄── short-lived        │                         │
+  │    Vault token (1h) ──│                         │
+  │                       │                         │
+  │── read KV ────────────►│                         │
+  │   secret/argocd/      │                         │
+  │   api-token           │                         │
+  │◄── ArgoCD API token ──│                         │
+  │    (TTL=1h, dynamic)  │                         │
+  │                       │                         │
+  │── Bearer token ───────────────────────────────►│
+  │   create/update/sync/delete application         │
 ```
 
 ### Components
 
 | Service | Image | Role |
 |---------|-------|------|
-| `vault` | `hashicorp/vault:1.15` | OIDC Identity Provider (dev mode) |
+| `vault` | `hashicorp/vault:1.15` | OIDC Provider + AppRole auth + KV secret engine (dev mode) |
 | `k3s` | `rancher/k3s:v1.28.5-k3s1` | Lightweight Kubernetes (runs ArgoCD) |
-| `setup` | `alpine:3.19` | One-shot: configures Vault OIDC + installs/configures ArgoCD |
-| `demo` | `alpine:3.19` | One-shot: runs the full dynamic-secret demo flow |
+| `setup` | `alpine:3.19` | One-shot: configures Vault (OIDC + AppRole + KV), installs + configures ArgoCD, stores dynamic token in Vault KV |
+| `client` | `alpine:3.19` | One-shot client: AppRole login → read token from Vault KV → ArgoCD CRUD |
 
-### Dynamic Secret Flow
+### Why this demonstrates "dynamic secrets"
 
-1. **Vault issues a short-lived OIDC ID token** on behalf of the authenticated user.
-   The token includes `groups` and `email` claims (expiry controlled by Vault).
-2. **ArgoCD trusts Vault** as an OIDC provider (configured via `argocd-cm`).
-   Group-to-role mapping is in `argocd-rbac-cm`:
-   `g, argocd-admins, role:admin`
-3. **ArgoCD generates a session/API token** after verifying the OIDC token against
-   Vault's JWKS endpoint.
-4. **The API token** (with configurable TTL) is used for
-   `create / read / update / sync / delete` ArgoCD Application API calls.
+| Property | Details |
+|----------|---------|
+| **No static credentials** | The client holds only AppRole `role_id` / `secret_id`; the ArgoCD API token is never baked into its environment |
+| **Short TTL** | The ArgoCD API token has a 1-hour TTL — it auto-expires |
+| **Vault as broker** | The token lives in `secret/argocd/api-token` (Vault KV); the client fetches it on every run |
+| **Short-lived Vault token** | The AppRole login returns a 1-hour Vault token used only to read from KV |
+| **OIDC for humans** | Browser users log into ArgoCD via Vault OIDC with group-based RBAC |
 
 ---
 
@@ -71,14 +91,14 @@ docker compose up
 Docker Compose will:
 1. Start **Vault** (dev mode, root token = `root`)
 2. Start **k3s** (Kubernetes)
-3. Run **setup** – configures Vault OIDC, installs ArgoCD, patches ArgoCD ConfigMaps, generates an API token
-4. Run **demo** – executes the full dynamic-secret flow and prints a summary
+3. Run **setup** – configures Vault (OIDC + AppRole + KV), installs ArgoCD, patches ArgoCD ConfigMaps, generates an API token and stores it in Vault KV
+4. Run **client** – authenticates to Vault via AppRole, reads the dynamic token from Vault KV, then creates/updates/syncs/deletes an ArgoCD application
 
 Watch progress in real time:
 
 ```bash
-docker compose logs -f setup   # watch setup steps
-docker compose logs -f demo    # watch the demo output
+docker compose logs -f setup    # watch setup steps
+docker compose logs -f client   # watch the dynamic-secret client output
 ```
 
 ---
@@ -87,7 +107,7 @@ docker compose logs -f demo    # watch the demo output
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
-| ArgoCD UI | http://localhost:8080 | `admin` / see demo summary |
+| ArgoCD UI | http://localhost:8080 | `admin` / see client summary output |
 | Vault UI | http://localhost:8200 | token: `root` |
 | Kubernetes API | https://localhost:6443 | kubeconfig in `k3s-output` volume |
 
@@ -113,17 +133,20 @@ for an ID token, verifying the `argocd-admins` group membership to grant
 
 ## Configuration Reference
 
-### Vault (OIDC Provider)
+### Vault (OIDC Provider + AppRole + KV)
 
-| Resource | Path |
+| Resource | Path / Value |
 |----------|------|
 | Signing key | `identity/oidc/key/argocd-key` (RS256, 24 h rotation) |
 | Scopes | `identity/oidc/scope/{groups,profile,email}` |
-| Client | `identity/oidc/client/argocd` |
-| Provider | `identity/oidc/provider/argocd` |
+| OIDC Client | `identity/oidc/client/argocd` |
+| OIDC Provider | `identity/oidc/provider/argocd` |
 | Discovery URL | `http://vault:8200/v1/identity/oidc/provider/argocd/.well-known/openid-configuration` |
-| Demo user | `argocd-admin` / `password` (userpass auth) |
+| Demo user (OIDC) | `argocd-admin` / `password` (userpass auth) |
 | Demo group | `argocd-admins` (internal group, member: `argocd-admin` entity) |
+| AppRole role | `auth/approle/role/argocd-client` (token_ttl=1h, secret_id_ttl=10m) |
+| Client policy | `sys/policies/acl/argocd-client` (read `secret/data/argocd/api-token`) |
+| Dynamic secret | `secret/data/argocd/api-token` (KV v2, ArgoCD API token + metadata) |
 
 ### ArgoCD (`argocd-cm` patch)
 
@@ -161,10 +184,10 @@ scopes: "[groups]"
 | Script | Purpose |
 |--------|---------|
 | `scripts/setup.sh` | Master orchestrator; installs kubectl, fixes kubeconfig, calls sub-scripts |
-| `scripts/vault-setup.sh` | Configures Vault Identity OIDC Provider (key → scopes → client → provider → user → entity → group) |
+| `scripts/vault-setup.sh` | Configures Vault OIDC Provider + AppRole auth + generates AppRole credentials |
 | `scripts/argocd-install.sh` | Installs ArgoCD in k3s, patches argocd-server to run `--insecure`, creates NodePort service |
-| `scripts/argocd-configure.sh` | Patches `argocd-cm` + `argocd-rbac-cm`, restarts argocd-server, creates API token |
-| `scripts/demo.sh` | End-to-end demo: Vault login → OIDC token → ArgoCD API token → create/update/sync/delete app |
+| `scripts/argocd-configure.sh` | Patches `argocd-cm` + `argocd-rbac-cm`, restarts argocd-server, creates API token, **stores token in Vault KV** |
+| `scripts/client.sh` | Client: AppRole login → read `secret/argocd/api-token` from Vault KV → create/update/sync/delete app |
 
 ---
 
@@ -196,5 +219,11 @@ The root token (`root`) never expires in dev mode. User tokens (`argocd-admin`) 
 ### ArgoCD API token expired
 ArgoCD API tokens in this PoC have a 1-hour TTL. Re-run the setup to generate a new one:
 ```bash
-docker compose stop setup demo && docker compose up setup demo
+docker compose stop setup client && docker compose up setup client
+```
+
+### AppRole secret_id expired
+The AppRole `secret_id` has a 10-minute TTL. Re-run setup to generate a new one:
+```bash
+docker compose stop setup client && docker compose up setup client
 ```

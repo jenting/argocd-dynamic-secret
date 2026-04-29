@@ -1,15 +1,23 @@
 # ArgoCD Dynamic Secret – Proof of Concept
 #
 # Architecture:
-#   vault  – HashiCorp Vault (dev mode) acting as the OIDC Identity Provider
-#   k3s    – Lightweight Kubernetes that runs ArgoCD
-#   setup  – One-shot container that configures Vault OIDC and installs/configures ArgoCD
-#   demo   – One-shot container that exercises the full dynamic-secret flow
-#             (Vault login → OIDC token → ArgoCD session token → create/update/delete app)
+#   vault   – HashiCorp Vault (dev mode):
+#              • OIDC Identity Provider (browser login to ArgoCD)
+#              • AppRole auth endpoint (machine/client authentication)
+#              • KV secret engine (stores the short-lived ArgoCD API token)
+#   k3s     – Lightweight Kubernetes that runs ArgoCD
+#   setup   – One-shot container:
+#              • Configures Vault OIDC + AppRole + KV engine
+#              • Installs + configures ArgoCD (OIDC + RBAC)
+#              • Generates a short-lived ArgoCD API token and stores it in Vault KV
+#   client  – One-shot container that demonstrates the dynamic-secret flow:
+#              • Authenticates to Vault via AppRole (no static credentials)
+#              • Reads the ArgoCD API token from Vault KV (the dynamic secret)
+#              • Uses the token to create / update / sync / delete an ArgoCD application
 #
 # Quick-start:
 #   docker compose up
-#   # Wait for the "demo" container to print its summary, then follow the README.
+#   docker compose logs -f client   # watch the dynamic-secret demo
 
 services:
 
@@ -92,10 +100,16 @@ services:
     networks:
       - poc-network
 
-  # ── End-to-end demo ───────────────────────────────────────────────────────────
-  demo:
+  # ── Client (dynamic-secret consumer) ────────────────────────────────────────
+  # Represents any automated system that needs ArgoCD API access.
+  # It holds NO static ArgoCD credentials – it fetches a short-lived token
+  # from Vault on every run:
+  #   1. AppRole login  → short-lived Vault token
+  #   2. Read Vault KV  → ArgoCD API token (the dynamic secret)
+  #   3. Call ArgoCD    → create / update / sync / delete application
+  client:
     image: alpine:3.19
-    container_name: demo
+    container_name: client
     depends_on:
       setup:
         condition: service_completed_successfully
@@ -107,7 +121,7 @@ services:
       - k3s-output:/k3s-output:ro
       - setup-output:/setup-output:ro
       - ./scripts:/scripts:ro
-    command: ["/bin/sh", "/scripts/demo.sh"]
+    command: ["/bin/sh", "/scripts/client.sh"]
     networks:
       - poc-network
 
