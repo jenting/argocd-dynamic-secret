@@ -48,6 +48,6 @@ sh /scripts/argocd-configure.sh
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  Setup complete!  Run 'docker compose logs demo -f'      ║"
+echo "║  Setup complete!  Run 'docker compose logs client -f'    ║"
 echo "║  to watch the end-to-end dynamic-secret demo.            ║"
 echo "╚══════════════════════════════════════════════════════════╝"

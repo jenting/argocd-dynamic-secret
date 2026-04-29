@@ -1,6 +1,6 @@
 # argocd-dynamic-secret
 
-Proof-of-concept Docker Compose environment that demonstrates **dynamic ArgoCD API tokens** backed by HashiCorp Vault — covering both machine-client access (AppRole + KV) and human browser login (OIDC).
+Proof-of-concept Docker Compose environment that demonstrates **dynamic ArgoCD API tokens** backed by HashiCorp Vault's OIDC Identity Provider. The client authenticates to Vault, receives a short-lived OIDC ID token containing group claims, and ArgoCD maps those groups to RBAC roles — eliminating static credentials entirely.
 
 ## Architecture
 
@@ -10,19 +10,24 @@ Proof-of-concept Docker Compose environment that demonstrates **dynamic ArgoCD A
 │                                                                              │
 │  ┌──────────────────────────────────────────────────────────────────────┐    │
 │  │  Vault :8200                                                         │    │
-│  │  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────┐ │    │
-│  │  │  OIDC Provider  │  │  AppRole auth     │  │  KV secret engine   │ │    │
-│  │  │  (browser login)│  │  (machine login)  │  │  argocd/api-token   │ │    │
-│  │  └────────┬────────┘  └────────┬─────────┘  └──────────┬──────────┘ │    │
-│  └───────────│────────────────────│───────────────────────│────────────┘    │
-│              │                    │                        │                  │
-│              │ JWKS/discovery     │ 1. AppRole login       │ 3. read token    │
-│              │                    │    → Vault token(1h)   │                  │
-│              ▼                    ▼                        │                  │
-│  ┌───────────────────┐   ┌────────────────────────────────▼───────────────┐  │
+│  │  ┌───────────────────────────────────────────────────────────────┐   │    │
+│  │  │  OIDC Identity Provider                                        │   │    │
+│  │  │  • RS256 signing key     • groups / profile / email scopes    │   │    │
+│  │  │  • authorize endpoint    • token endpoint (PKCE)              │   │    │
+│  │  │  • JWKS endpoint (for ArgoCD to verify token signatures)      │   │    │
+│  │  └────────────────────────────┬──────────────────────────────────┘   │    │
+│  └───────────────────────────────│──────────────────────────────────────┘    │
+│                                  │                                            │
+│       1. userpass login          │ 2. PKCE authorize (headless)              │
+│          → Vault token           │    → auth code                            │
+│                              3. token exchange                                │
+│                                  │    → ID token (groups, email)             │
+│                                  │                                            │
+│  ┌───────────────────┐   ┌───────┴────────────────────────────────────────┐  │
 │  │  ArgoCD (k3s)     │   │  client container                               │  │
-│  │  :8080 (NodePort) │◄──│  2. Vault token → read secret/argocd/api-token │  │
-│  │                   │   │  4. ArgoCD API token → create/update/delete app │  │
+│  │  :8080 (NodePort) │◄──│  4. POST /api/v1/session  {token: <id_token>}  │  │
+│  │                   │   │     → ArgoCD validates via Vault JWKS           │  │
+│  │                   │◄──│  5. ArgoCD session token → CRUD applications    │  │
 │  └───────────────────┘   └────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -30,40 +35,46 @@ Proof-of-concept Docker Compose environment that demonstrates **dynamic ArgoCD A
 ### Dynamic Secret Flow (client)
 
 ```
-Client                  Vault                    ArgoCD
-  │                       │                         │
-  │── AppRole login ──────►│                         │
-  │◄── short-lived        │                         │
-  │    Vault token (1h) ──│                         │
-  │                       │                         │
-  │── read KV ────────────►│                         │
-  │   secret/argocd/      │                         │
-  │   api-token           │                         │
-  │◄── ArgoCD API token ──│                         │
-  │    (TTL=1h, dynamic)  │                         │
-  │                       │                         │
-  │── Bearer token ───────────────────────────────►│
-  │   create/update/sync/delete application         │
+Client                  Vault (OIDC Provider)        ArgoCD
+  │                            │                        │
+  │── 1. userpass login ───────►│                        │
+  │◄── Vault token (TTL=1h) ───│                        │
+  │                            │                        │
+  │── 2. authorize (PKCE) ─────►│                        │
+  │   X-Vault-Token: <token>   │                        │
+  │◄── 302 redirect + auth code│                        │
+  │                            │                        │
+  │── 3. token exchange ────────►│                        │
+  │   code + code_verifier     │                        │
+  │◄── OIDC ID token (RS256) ──│                        │
+  │   claims: groups, email     │                        │
+  │                            │                        │
+  │── 4. POST /api/v1/session ──────────────────────────►│
+  │      { token: <id_token> } │  verifies via JWKS     │
+  │◄── ArgoCD session token ─────────────────────────── │
+  │                            │                        │
+  │── 5. Bearer: session_token ─────────────────────────►│
+  │   create/update/sync/delete application             │
 ```
 
 ### Components
 
 | Service | Image | Role |
 |---------|-------|------|
-| `vault` | `hashicorp/vault:1.15` | OIDC Provider + AppRole auth + KV secret engine (dev mode) |
+| `vault` | `hashicorp/vault:1.15` | OIDC Identity Provider (dev mode): signing key, scopes, provider endpoint, userpass auth |
 | `k3s` | `rancher/k3s:v1.28.5-k3s1` | Lightweight Kubernetes (runs ArgoCD) |
-| `setup` | `alpine:3.19` | One-shot: configures Vault (OIDC + AppRole + KV), installs + configures ArgoCD, stores dynamic token in Vault KV |
-| `client` | `alpine:3.19` | One-shot client: AppRole login → read token from Vault KV → ArgoCD CRUD |
+| `setup` | `alpine:3.19` | One-shot: configures Vault OIDC + AppRole + KV; installs + patches ArgoCD with OIDC config |
+| `client` | `alpine:3.19` | One-shot: userpass → PKCE OIDC flow → ID token → ArgoCD session → CRUD |
 
 ### Why this demonstrates "dynamic secrets"
 
 | Property | Details |
 |----------|---------|
-| **No static credentials** | The client holds only AppRole `role_id` / `secret_id`; the ArgoCD API token is never baked into its environment |
-| **Short TTL** | The ArgoCD API token has a 1-hour TTL — it auto-expires |
-| **Vault as broker** | The token lives in `secret/argocd/api-token` (Vault KV); the client fetches it on every run |
-| **Short-lived Vault token** | The AppRole login returns a 1-hour Vault token used only to read from KV |
-| **OIDC for humans** | Browser users log into ArgoCD via Vault OIDC with group-based RBAC |
+| **No static ArgoCD credentials** | The client never holds a long-lived ArgoCD token — it obtains a session on every run |
+| **Short-lived ID token** | Vault issues an OIDC ID token with a configurable TTL (default 30 min) — it auto-expires |
+| **Group-based access** | The `groups` claim in the ID token drives ArgoCD RBAC — no static role assignments |
+| **Vault JWKS verification** | ArgoCD fetches Vault's JWKS to verify token signatures — no shared secret required |
+| **PKCE for code security** | Authorization code flow uses PKCE (S256), preventing code interception |
 
 ---
 
@@ -91,14 +102,14 @@ docker compose up
 Docker Compose will:
 1. Start **Vault** (dev mode, root token = `root`)
 2. Start **k3s** (Kubernetes)
-3. Run **setup** – configures Vault (OIDC + AppRole + KV), installs ArgoCD, patches ArgoCD ConfigMaps, generates an API token and stores it in Vault KV
-4. Run **client** – authenticates to Vault via AppRole, reads the dynamic token from Vault KV, then creates/updates/syncs/deletes an ArgoCD application
+3. Run **setup** – configures Vault OIDC provider + AppRole; installs ArgoCD; patches ArgoCD ConfigMaps with Vault OIDC settings
+4. Run **client** – userpass login → PKCE OIDC authorize → ID token (with `groups`) → ArgoCD session → CRUD
 
 Watch progress in real time:
 
 ```bash
 docker compose logs -f setup    # watch setup steps
-docker compose logs -f client   # watch the dynamic-secret client output
+docker compose logs -f client   # watch the OIDC dynamic-secret client output
 ```
 
 ---
@@ -133,20 +144,19 @@ for an ID token, verifying the `argocd-admins` group membership to grant
 
 ## Configuration Reference
 
-### Vault (OIDC Provider + AppRole + KV)
+### Vault (OIDC Provider)
 
 | Resource | Path / Value |
 |----------|------|
 | Signing key | `identity/oidc/key/argocd-key` (RS256, 24 h rotation) |
 | Scopes | `identity/oidc/scope/{groups,profile,email}` |
-| OIDC Client | `identity/oidc/client/argocd` |
+| OIDC Client | `identity/oidc/client/argocd` (`id_token_ttl=30m`) |
 | OIDC Provider | `identity/oidc/provider/argocd` |
 | Discovery URL | `http://vault:8200/v1/identity/oidc/provider/argocd/.well-known/openid-configuration` |
-| Demo user (OIDC) | `argocd-admin` / `password` (userpass auth) |
-| Demo group | `argocd-admins` (internal group, member: `argocd-admin` entity) |
-| AppRole role | `auth/approle/role/argocd-client` (token_ttl=1h, secret_id_ttl=10m) |
-| Client policy | `sys/policies/acl/argocd-client` (read `secret/data/argocd/api-token`) |
-| Dynamic secret | `secret/data/argocd/api-token` (KV v2, ArgoCD API token + metadata) |
+| JWKS URI | `http://vault:8200/v1/identity/oidc/provider/argocd/.well-known/keys` |
+| Demo user | `argocd-admin` / `password` (userpass auth) |
+| Demo group | `argocd-admins` (internal group, member: `argocd-admin` entity, present in `groups` claim) |
+| AppRole role | `auth/approle/role/argocd-client` (available as additional auth option) |
 
 ### ArgoCD (`argocd-cm` patch)
 
@@ -184,10 +194,10 @@ scopes: "[groups]"
 | Script | Purpose |
 |--------|---------|
 | `scripts/setup.sh` | Master orchestrator; installs kubectl, fixes kubeconfig, calls sub-scripts |
-| `scripts/vault-setup.sh` | Configures Vault OIDC Provider + AppRole auth + generates AppRole credentials |
+| `scripts/vault-setup.sh` | Configures Vault OIDC Provider (key → scopes → client → provider → userpass user → entity → group) + AppRole |
 | `scripts/argocd-install.sh` | Installs ArgoCD in k3s, patches argocd-server to run `--insecure`, creates NodePort service |
-| `scripts/argocd-configure.sh` | Patches `argocd-cm` + `argocd-rbac-cm`, restarts argocd-server, creates API token, **stores token in Vault KV** |
-| `scripts/client.sh` | Client: AppRole login → read `secret/argocd/api-token` from Vault KV → create/update/sync/delete app |
+| `scripts/argocd-configure.sh` | Patches `argocd-cm` + `argocd-rbac-cm` with Vault OIDC settings; restarts argocd-server |
+| `scripts/client.sh` | Client: userpass login → PKCE authorize → ID token (groups) → ArgoCD session → create/update/sync/delete |
 
 ---
 
@@ -216,14 +226,13 @@ Common causes:
 ### Vault token expired
 The root token (`root`) never expires in dev mode. User tokens (`argocd-admin`) have the default lease (32 days in dev mode).
 
-### ArgoCD API token expired
-ArgoCD API tokens in this PoC have a 1-hour TTL. Re-run the setup to generate a new one:
+### OIDC ID token expired
+The Vault OIDC ID token has a 30-minute TTL (`id_token_ttl=30m` on the OIDC client). Re-run the client to get a fresh token:
 ```bash
-docker compose stop setup client && docker compose up setup client
+docker compose stop client && docker compose up client
 ```
 
-### AppRole secret_id expired
-The AppRole `secret_id` has a 10-minute TTL. Re-run setup to generate a new one:
-```bash
-docker compose stop setup client && docker compose up setup client
-```
+### ArgoCD session creation fails (client Step 6)
+- Ensure ArgoCD's `argocd-cm` OIDC config has been applied (re-run `setup`)
+- Check that the `issuer` in `argocd-cm` exactly matches `VAULT_OIDC_ISSUER` in `vault-oidc.env`
+- Verify Vault's JWKS is reachable from ArgoCD: `curl http://vault:8200/v1/identity/oidc/provider/argocd/.well-known/keys`
