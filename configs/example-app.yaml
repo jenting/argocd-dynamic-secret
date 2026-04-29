@@ -1,0 +1,28 @@
+# Example ArgoCD Application manifest
+# This resource demonstrates the kind of object created / managed via the
+# ArgoCD create/update/delete API in the dynamic-secret demo.
+#
+# You can apply this manually with:
+#   kubectl apply -f configs/example-app.yaml -n argocd
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/managed-by: dynamic-secret-poc
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
+    syncOptions:
+      - CreateNamespace=true

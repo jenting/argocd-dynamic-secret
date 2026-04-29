@@ -1,0 +1,125 @@
+# ArgoCD Dynamic Secret – Proof of Concept
+#
+# Architecture:
+#   vault  – HashiCorp Vault (dev mode) acting as the OIDC Identity Provider
+#   k3s    – Lightweight Kubernetes that runs ArgoCD
+#   setup  – One-shot container that configures Vault OIDC and installs/configures ArgoCD
+#   demo   – One-shot container that exercises the full dynamic-secret flow
+#             (Vault login → OIDC token → ArgoCD session token → create/update/delete app)
+#
+# Quick-start:
+#   docker compose up
+#   # Wait for the "demo" container to print its summary, then follow the README.
+
+services:
+
+  # ── Vault ────────────────────────────────────────────────────────────────────
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: vault
+    hostname: vault
+    restart: unless-stopped
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_LOG_LEVEL: "info"
+    command: vault server -dev
+    ports:
+      - "8200:8200"
+    networks:
+      - poc-network
+    healthcheck:
+      test: ["CMD", "vault", "status", "-address=http://127.0.0.1:8200"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # ── Lightweight Kubernetes (hosts ArgoCD) ────────────────────────────────────
+  k3s:
+    image: rancher/k3s:v1.28.5-k3s1
+    container_name: k3s
+    hostname: k3s
+    privileged: true
+    restart: unless-stopped
+    command: server --disable=traefik --tls-san=k3s --tls-san=localhost
+    environment:
+      K3S_KUBECONFIG_OUTPUT: "/k3s-output/kubeconfig.yaml"
+      K3S_KUBECONFIG_MODE: "644"
+    volumes:
+      - k3s-output:/k3s-output
+      - k3s-server:/var/lib/rancher/k3s
+      - k3s-cni:/var/lib/cni
+    ports:
+      - "6443:6443"   # Kubernetes API server
+      - "8080:30080"  # ArgoCD UI (NodePort → host)
+    networks:
+      - poc-network
+    healthcheck:
+      test: ["CMD-SHELL", "k3s kubectl get nodes 2>/dev/null | grep -q ' Ready'"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  # ── One-time setup ────────────────────────────────────────────────────────────
+  setup:
+    image: alpine:3.19
+    container_name: setup
+    depends_on:
+      vault:
+        condition: service_healthy
+      k3s:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+      K3S_HOST: "k3s"
+      ARGOCD_VERSION: "v2.9.3"
+      ARGOCD_NAMESPACE: "argocd"
+      # Redirect URI must match what the user's browser resolves.
+      # http://localhost:8080 is where ArgoCD is exposed on the host.
+      ARGOCD_REDIRECT_URI: "http://localhost:8080/auth/callback"
+      ARGOCD_URL: "http://localhost:8080"
+    volumes:
+      - k3s-output:/k3s-output:ro
+      - ./scripts:/scripts:ro
+      - ./configs:/configs:ro
+      - setup-output:/setup-output
+    command: ["/bin/sh", "/scripts/setup.sh"]
+    networks:
+      - poc-network
+
+  # ── End-to-end demo ───────────────────────────────────────────────────────────
+  demo:
+    image: alpine:3.19
+    container_name: demo
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      K3S_HOST: "k3s"
+      ARGOCD_NAMESPACE: "argocd"
+    volumes:
+      - k3s-output:/k3s-output:ro
+      - setup-output:/setup-output:ro
+      - ./scripts:/scripts:ro
+    command: ["/bin/sh", "/scripts/demo.sh"]
+    networks:
+      - poc-network
+
+volumes:
+  k3s-output:
+  k3s-server:
+  k3s-cni:
+  setup-output:
+
+networks:
+  poc-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
